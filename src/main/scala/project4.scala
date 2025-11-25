@@ -106,10 +106,12 @@ class RegisterFile extends Module {
   })
 
   // 32 个 32 位寄存器，复位时全部清零
-  // RegInit + VecInit 实现一个寄存器数组
   val regs = RegInit(VecInit(Seq.fill(32)(0.U(32.W))))
 
-  // TODO
+  // 异步读：直接通过地址索引寄存器数组
+  // x0 必须始终为 0，所以当读地址为 0 时强制返回 0
+  io.rdata1 := Mux(io.rs1 === 0.U, 0.U, regs(io.rs1))
+  io.rdata2 := Mux(io.rs2 === 0.U, 0.U, regs(io.rs2))
 
   // 同步写：在时钟上升沿更新寄存器内容
   // 同时禁止对 x0 写（waddr =/= 0）
@@ -117,7 +119,6 @@ class RegisterFile extends Module {
     regs(io.waddr) := io.wdata
   }
 }
-
 // ==========================================
 // 3. 异步指令存储器 (Instruction Memory)
 // 说明：
