@@ -108,16 +108,16 @@ class RegisterFile extends Module {
   // 32 个 32 位寄存器，复位时全部清零
   val regs = RegInit(VecInit(Seq.fill(32)(0.U(32.W))))
 
-  // 异步读：直接通过地址索引寄存器数组
-  // x0 必须始终为 0，所以当读地址为 0 时强制返回 0
-  io.rdata1 := Mux(io.rs1 === 0.U, 0.U, regs(io.rs1))
-  io.rdata2 := Mux(io.rs2 === 0.U, 0.U, regs(io.rs2))
-
   // 同步写：在时钟上升沿更新寄存器内容
   // 同时禁止对 x0 写（waddr =/= 0）
   when (io.wen && io.waddr =/= 0.U) {
     regs(io.waddr) := io.wdata
   }
+
+    // 异步读：直接通过地址索引寄存器数组
+  // x0 必须始终为 0，所以当读地址为 0 时强制返回 0
+  io.rdata1 := Mux(io.rs1 === 0.U, 0.U, regs(io.rs1))
+  io.rdata2 := Mux(io.rs2 === 0.U, 0.U, regs(io.rs2))
 }
 // ==========================================
 // 3. 异步指令存储器 (Instruction Memory)
@@ -215,23 +215,9 @@ class SingleCycleCPU extends Module {
   io.currentPC := pc
 
   // 2. 译码器 (Decoder) Logic
-  // -------------------------
-  // RISC-V 通用字段分解
   val opcode = inst(6, 0)   // 指令低 7 位：opcode
-  val rd     = inst(11, 7)  // 目的寄存器
-  val funct3 = inst(14, 12) // 中间 3 位：funct3
-  val rs1    = inst(19, 15) // 源寄存器 1
-  val rs2    = inst(24, 20) // 源寄存器 2
-  val funct7 = inst(31, 25) // 高 7 位：funct7
 
-  // 各种指令格式的立即数生成
-  // I-Type 立即数：bits[31:20]，需要符号扩展到 32 位
-  immI := inst(31, 20).asSInt
-
-  // U-Type 立即数：bits[31:12] << 12，低 12 位为 0
-  immU := (inst(31, 12) << 12).asSInt
-
-  // TODO
+  // // U-Type 立即数：bits[31:12] << 12，低 12 位为 0
   // 控制信号：根据 opcode 判断指令类型
   val isRType = (opcode === "b0110011".U) // R 型运算指令
   val isIType = (opcode === "b0010011".U) // I 型运算指令
@@ -242,32 +228,50 @@ class SingleCycleCPU extends Module {
   val aluOp = Wire(UInt(4.W))
   aluOp := ALUOps.ADD // 默认是加法（即使不被使用也给一个安全默认值）
 
-  when (isRType || isIType) {
-    switch(funct3) {
-      is("b000".U) { // ADD / SUB / ADDI
-        // R-type 且 funct7 为 0100000 -> SUB
-        when (isRType && funct7 === "b0100000".U) {
-          aluOp := ALUOps.SUB
-        } .otherwise {
-          // 其余情况 (R: ADD, I: ADDI) 都是 ADD
-          aluOp := ALUOps.ADD
-        }
+// 3. 按类型分别处理
+when (isRType) {
+
+  val rd     = inst(11, 7)  // 目的寄存器
+  val funct3 = inst(14, 12) // 中间 3 位：funct3
+  val rs1    = inst(19, 15) // 源寄存器 1
+  val rs2    = inst(24, 20) // 源寄存器 2
+  val funct7 = inst(31, 25) // 高 7 位：funct7
+
+  // R-type: funct3 + funct7 决定 ALU 操作
+  switch (funct3) {
+    is ("b000".U) {                // ADD / SUB
+      when (funct7 === "b0100000".U) {
+        aluOp := ALUOps.SUB        // SUB
+      } .otherwise {
+        aluOp := ALUOps.ADD        // ADD
       }
-      is("b001".U) { aluOp := ALUOps.SLL }   // SLL / SLLI
-      is("b010".U) { aluOp := ALUOps.SLT }   // SLT / SLTI
-      is("b011".U) { aluOp := ALUOps.SLTU }  // SLTU / SLTIU
-      is("b100".U) { aluOp := ALUOps.XOR }   // XOR / XORI
-      is("b101".U) { // SRL / SRA / SRLI / SRAI
-        when (funct7 === "b0100000".U) {
-          aluOp := ALUOps.SRA
-        } .otherwise {
-          aluOp := ALUOps.SRL
-        }
-      }
-      is("b110".U) { aluOp := ALUOps.OR }    // OR / ORI
-      is("b111".U) { aluOp := ALUOps.AND }   // AND / ANDI
     }
+    is ("b001".U) { aluOp := ALUOps.SLL  } // SLL
+    // is ("b010".U) { aluOp := ALUOps.SLT  } // SLT
+    is ("b011".U) { aluOp := ALUOps.SLTU } // SLTU
+    is ("b100".U) { aluOp := ALUOps.XOR  } // XOR
+    is ("b110".U) { aluOp := ALUOps.OR   } // OR
+    is ("b111".U) { aluOp := ALUOps.AND  } // AND
   }
+} .elsewhen (isIType) {
+  val rd     = inst(11, 7)  // 目的寄存器
+  val funct3 = inst(14, 12) // 中间 3 位：funct3
+  val rs1    = inst(19, 15) // 源寄存器 1
+  val immI := inst(31, 20).asSInt // 获取立即数
+
+  switch (funct3) {
+      is ("b000".U) { aluOp := ALUOps.addi }
+      is ("b001".U) { aluOp := ALUOps.slli }
+      is ("b010".U) { aluOp := ALUOps.slti }
+    }
+} .elsewhen (isLUI || isAUIPC) { // U类型
+  val immU := (inst(31, 12) << 12).asSInt
+  aluOp := ALUOps.ADD
+} .otherwise {
+  // 其它类型（以后扩展 load/store/branch/jump）在这里继续加分支
+  // val immU := (inst(31, 12) << 12).asSInt
+  aluOp := ALUOps.ADD
+}
 
   // 3. 寄存器堆 & 操作数准备
   // -------------------------
