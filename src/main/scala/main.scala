@@ -2,325 +2,463 @@ import chisel3._
 import chisel3.util._
 
 // ==========================================
+// 配置参数类
+// ==========================================
+class CPUConfig {
+  val XLEN = 32           // 数据位宽
+  val ADDR_WIDTH = 32     // 地址位宽
+  val REG_NUM = 32        // 寄存器数量
+  val IMEM_SIZE = 1024    // 指令存储器大小（字）
+  val DMEM_SIZE = 1024    // 数据存储器大小（字）
+  val PC_START = 0x0      // PC 起始地址
+}
+
+// ==========================================
 // 1. ALU 操作码枚举
 // ==========================================
 object ALUOps extends ChiselEnum {
   val ADD, SUB, SLL, SLT, SLTU, XOR, SRL, SRA, OR, AND = Value
-  val ERROR = Value
 }
 
 // ==========================================
-// 2. 控制器 (Control Unit)
+// 2. 控制信号 Bundle（优化版）
 // ==========================================
-class ControlUnit extends Module {
+class ControlSignals extends Bundle {
+  val aluOp   = ALUOps()    // ALU操作类型
+  val regWen  = Bool()      // 寄存器写使能
+  val memWen  = Bool()      // 内存写使能
+  val aluSrc1 = UInt(2.W)   // ALU源1选择: 0=RS1, 1=PC, 2=0
+  val aluSrc2 = Bool()      // ALU源2选择: 0=RS2, 1=Imm
+  val wbSrc   = UInt(2.W)   // 写回源选择: 0=ALU, 1=Mem, 2=PC+4
+  val pcSrc   = UInt(2.W)   // PC源选择: 0=+4, 1=Branch, 2=JAL, 3=JALR
+}
+
+// ==========================================
+// 3. 控制器 (Control Unit)
+// ==========================================
+class ControlUnit(implicit config: CPUConfig) extends Module {
   val io = IO(new Bundle {
-    val opcode  = Input(UInt(7.W))
-    val funct3  = Input(UInt(3.W))
-    val funct7  = Input(UInt(7.W))
-
-    // 控制信号输出
-    val aluOp   = Output(ALUOps())
-    val regWen  = Output(Bool())
-    val memWen  = Output(Bool())
-    val src1Sel = Output(UInt(2.W)) // 0: RS1, 1: PC, 2: 0 (for LUI)
-    val src2Sel = Output(UInt(1.W)) // 0: RS2, 1: Imm
-    val wbSel   = Output(UInt(1.W)) // 0: ALU, 1: Mem
-    val isSigned = Output(Bool())
-
-    // 转移指令专用信号
-    val isBranch      = Output(Bool()) // 是否为分支指令 (B-Type)
-    val isBeq         = Output(Bool()) // 细分：是否为 BEQ
-    val isJal         = Output(Bool()) // 是否为 JAL
-    val isJalr        = Output(Bool()) // 是否为 JALR
-    val isLink        = Output(Bool()) // 是否需要保存返回地址 (PC+4)
+    val opcode = Input(UInt(7.W))
+    val funct3 = Input(UInt(3.W))
+    val funct7 = Input(UInt(7.W))
+    val ctrl   = Output(new ControlSignals)
   })
 
-  // 默认值
-  io.aluOp   := ALUOps.ADD
-  io.regWen  := false.B
-  io.memWen  := false.B
-  io.src1Sel := 0.U
-  io.src2Sel := 0.U
-  io.wbSel   := 0.U
-  io.isSigned := false.B
+  // 默认控制信号
+  val defaultCtrl = Wire(new ControlSignals)
+  defaultCtrl.aluOp   := ALUOps.ADD
+  defaultCtrl.regWen  := false.B
+  defaultCtrl.memWen  := false.B
+  defaultCtrl.aluSrc1 := 0.U
+  defaultCtrl.aluSrc2 := false.B
+  defaultCtrl.wbSrc   := 0.U
+  defaultCtrl.pcSrc   := 0.U
 
-  io.isBranch     := false.B
-  io.isBeq        := false.B
-  io.isJal        := false.B
-  io.isJalr       := false.B
-  io.isLink       := false.B
+  io.ctrl := defaultCtrl
 
-  // 指令解码
-  val isRType  = io.opcode === "b0110011".U
-  val isIType  = io.opcode === "b0010011".U
-  val isLoad   = io.opcode === "b0000011".U
-  val isStore  = io.opcode === "b0100011".U
-  val isLUI    = io.opcode === "b0110111".U
-  val isAUIPC  = io.opcode === "b0010111".U
-  val isBranch = io.opcode === "b1100011".U
-  val isJal    = io.opcode === "b1101111".U
-  val isJalr   = io.opcode === "b1100111".U
+  // 指令类型识别
+  val opcode = io.opcode
+  val isRType  = opcode === "b0110011".U
+  val isIType  = opcode === "b0010011".U
+  val isLoad   = opcode === "b0000011".U
+  val isStore  = opcode === "b0100011".U
+  val isLUI    = opcode === "b0110111".U
+  val isAUIPC  = opcode === "b0010111".U
+  val isBranch = opcode === "b1100011".U
+  val isJAL    = opcode === "b1101111".U
+  val isJALR   = opcode === "b1100111".U
 
-  // 细分信号
-  io.isBranch := isBranch
-  io.isJal    := isJal
-  io.isJalr   := isJalr
-  io.isLink   := isJal || isJalr // JAL 和 JALR 都需要写回 PC+4
-  io.isBeq    := isBranch && (io.funct3 === "b000".U) // funct3=000 为 BEQ
-
-  // ALU 控制逻辑
+  // ========== R-Type / I-Type 算术逻辑指令 ==========
   when(isRType || isIType) {
+    io.ctrl.regWen  := true.B
+    io.ctrl.aluSrc1 := 0.U // RS1
+    io.ctrl.aluSrc2 := isIType
+    io.ctrl.wbSrc   := 0.U // ALU结果写回
+
     switch(io.funct3) {
-      is("b000".U) { // ADD or SUB
-        when(isRType && io.funct7 === "b0100000".U) { io.aluOp := ALUOps.SUB }
-          .otherwise { io.aluOp := ALUOps.ADD }
+      is("b000".U) {
+        io.ctrl.aluOp := Mux(isRType && io.funct7 === "b0100000".U, 
+                             ALUOps.SUB, ALUOps.ADD)
       }
-      is("b001".U) { io.aluOp := ALUOps.SLL }
-      is("b010".U) { io.aluOp := ALUOps.SLT }
-      is("b011".U) { io.aluOp := ALUOps.SLTU }
-      is("b100".U) { io.aluOp := ALUOps.XOR }
-      is("b101".U) { // SRL or SRA
-        when(io.funct7 === "b0100000".U) { io.aluOp := ALUOps.SRA }
-          .otherwise { io.aluOp := ALUOps.SRL }
+      is("b001".U) { io.ctrl.aluOp := ALUOps.SLL  }
+      is("b010".U) { io.ctrl.aluOp := ALUOps.SLT  }
+      is("b011".U) { io.ctrl.aluOp := ALUOps.SLTU }
+      is("b100".U) { io.ctrl.aluOp := ALUOps.XOR  }
+      is("b101".U) {
+        io.ctrl.aluOp := Mux(io.funct7 === "b0100000".U, 
+                             ALUOps.SRA, ALUOps.SRL)
       }
-      is("b110".U) { io.aluOp := ALUOps.OR }
-      is("b111".U) { io.aluOp := ALUOps.AND }
+      is("b110".U) { io.ctrl.aluOp := ALUOps.OR  }
+      is("b111".U) { io.ctrl.aluOp := ALUOps.AND }
     }
   }
-  io.isSigned := (io.aluOp === ALUOps.ADD) || (io.aluOp === ALUOps.SUB) ||
-                 (io.aluOp === ALUOps.SLT) || (io.aluOp === ALUOps.SRA)
 
-  // 数据通路控制信号
-  when(isRType) {
-    io.regWen := true.B; io.src1Sel := 0.U; io.src2Sel := 0.U; io.wbSel := 0.U
-  } .elsewhen(isIType) {
-    io.regWen := true.B; io.src1Sel := 0.U; io.src2Sel := 1.U; io.wbSel := 0.U
-  } .elsewhen(isLoad) {
-    io.regWen := true.B; io.src1Sel := 0.U; io.src2Sel := 1.U; io.wbSel := 1.U
-    io.aluOp := ALUOps.ADD
-  } .elsewhen(isStore) {
-    io.memWen := true.B; io.src1Sel := 0.U; io.src2Sel := 1.U; io.aluOp := ALUOps.ADD
-  } .elsewhen(isLUI) {
-    io.regWen := true.B; io.src1Sel := 2.U; io.src2Sel := 1.U; io.aluOp := ALUOps.ADD
-  } .elsewhen(isAUIPC) {
-    io.regWen := true.B; io.src1Sel := 1.U; io.src2Sel := 1.U; io.aluOp := ALUOps.ADD
-  } .elsewhen(isBranch) {
-    // Branch: ALU 做减法比较，不写回
-    io.regWen := false.B; io.src1Sel := 0.U; io.src2Sel := 0.U; io.aluOp := ALUOps.SUB
-  } .elsewhen(isJal) {
-    // JAL: 需要写回 PC+4, ALU 计算跳转目标(PC+Imm)用于调试或辅助
-    io.regWen := true.B; io.src1Sel := 1.U; io.src2Sel := 1.U; io.aluOp := ALUOps.ADD
-  } .elsewhen(isJalr) {
-    // JALR: 需要写回 PC+4, ALU 计算跳转目标(RS1+Imm)
-    io.regWen := true.B; io.src1Sel := 0.U; io.src2Sel := 1.U; io.aluOp := ALUOps.ADD
+  // ========== Load 指令 ==========
+  .elsewhen(isLoad) {
+    io.ctrl.regWen  := true.B
+    io.ctrl.aluSrc1 := 0.U // RS1
+    io.ctrl.aluSrc2 := true.B // Imm
+    io.ctrl.aluOp   := ALUOps.ADD
+    io.ctrl.wbSrc   := 1.U // Mem数据写回
+  }
+
+  // ========== Store 指令 ==========
+  .elsewhen(isStore) {
+    io.ctrl.memWen  := true.B
+    io.ctrl.aluSrc1 := 0.U // RS1
+    io.ctrl.aluSrc2 := true.B // Imm
+    io.ctrl.aluOp   := ALUOps.ADD
+  }
+
+  // ========== LUI 指令 ==========
+  .elsewhen(isLUI) {
+    io.ctrl.regWen  := true.B
+    io.ctrl.aluSrc1 := 2.U // Nop
+    io.ctrl.aluSrc2 := true.B // Imm
+    io.ctrl.aluOp   := ALUOps.ADD
+  }
+
+  // ========== AUIPC 指令 ==========
+  .elsewhen(isAUIPC) {
+    io.ctrl.regWen  := true.B
+    io.ctrl.aluSrc1 := 1.U
+    io.ctrl.aluSrc2 := true.B
+    io.ctrl.aluOp   := ALUOps.ADD
+  }
+
+  // ========== Branch 指令 ==========
+  .elsewhen(isBranch) {
+    io.ctrl.aluSrc1 := 0.U // RS1
+    io.ctrl.aluSrc2 := false.B // RS2
+    io.ctrl.pcSrc   := 1.U // Branch
+
+    switch(io.funct3) {
+      is("b000".U, "b001".U) { io.ctrl.aluOp := ALUOps.SUB  }
+      is("b100".U, "b101".U) { io.ctrl.aluOp := ALUOps.SLT  }
+      is("b110".U, "b111".U) { io.ctrl.aluOp := ALUOps.SLTU }
+    }
+  }
+
+  // ========== JAL 指令 ==========
+  .elsewhen(isJAL) {
+    io.ctrl.regWen := true.B // 写回PC+4
+    io.ctrl.wbSrc  := 2.U // PC+4
+    io.ctrl.pcSrc  := 2.U // JAL目标地址
+  }
+
+  // ========== JALR 指令 ==========
+  .elsewhen(isJALR) {
+    io.ctrl.regWen  := true.B
+    io.ctrl.aluSrc1 := 0.U
+    io.ctrl.aluSrc2 := true.B
+    io.ctrl.aluOp   := ALUOps.ADD
+    io.ctrl.wbSrc   := 2.U
+    io.ctrl.pcSrc   := 3.U
   }
 }
 
 // ==========================================
-// 3. 立即数生成器 (ImmGen)
+// 4. 立即数生成器 (ImmGen)
 // ==========================================
-class ImmGen extends Module {
+class ImmGen(implicit config: CPUConfig) extends Module {
   val io = IO(new Bundle {
-    val inst = Input(UInt(32.W))
-    val out  = Output(UInt(32.W))
+    val inst = Input(UInt(config.XLEN.W))
+    val imm  = Output(UInt(config.XLEN.W))
   })
+
   val inst = io.inst
   val opcode = inst(6, 0)
 
   val immI = Cat(Fill(20, inst(31)), inst(31, 20)).asSInt
   val immS = Cat(Fill(20, inst(31)), inst(31, 25), inst(11, 7)).asSInt
-  val immU = Cat(inst(31, 12), 0.U(12.W)).asSInt
   val immB = Cat(Fill(19, inst(31)), inst(31), inst(7), inst(30, 25), inst(11, 8), 0.U(1.W)).asSInt
+  val immU = Cat(inst(31, 12), 0.U(12.W)).asSInt
   val immJ = Cat(Fill(11, inst(31)), inst(31), inst(19, 12), inst(20), inst(30, 21), 0.U(1.W)).asSInt
 
-  io.out := MuxCase(0.S, Seq(
-    (opcode === "b0100011".U) -> immS, // Store
-    ((opcode === "b0110111".U) || (opcode === "b0010111".U)) -> immU, // LUI/AUIPC
-    (opcode === "b1100011".U) -> immB, // Branch
-    (opcode === "b1101111".U) -> immJ, // JAL
-    (true.B)                  -> immI  // Default I-Type
-  )).asUInt
+  io.imm := MuxLookup(opcode, immI.asUInt)(Seq(
+    "b0100011".U -> immS.asUInt,
+    "b1100011".U -> immB.asUInt,
+    "b0110111".U -> immU.asUInt,
+    "b0010111".U -> immU.asUInt,
+    "b1101111".U -> immJ.asUInt
+  ))
 }
 
 // ==========================================
-// 4. ALU 模块
+// 5. ALU 模块
 // ==========================================
-class ALU extends Module {
+class ALU(implicit config: CPUConfig) extends Module {
   val io = IO(new Bundle {
-    val a      = Input(UInt(32.W))
-    val b      = Input(UInt(32.W))
+    val a      = Input(UInt(config.XLEN.W))
+    val b      = Input(UInt(config.XLEN.W))
     val aluOp  = Input(ALUOps())
-    val out    = Output(UInt(32.W))
-    val zf     = Output(Bool())
-    val of     = Output(Bool())
+    val result = Output(UInt(config.XLEN.W))
+    val zero   = Output(Bool())
   })
+
   val shamt = io.b(4, 0)
-  val isSub = (io.aluOp === ALUOps.SUB) || (io.aluOp === ALUOps.SLT) || (io.aluOp === ALUOps.SLTU)
-  val adderB = Mux(isSub, (~io.b).asUInt, io.b)
-  val sum    = io.a + adderB + isSub.asUInt
+  
+  val isSub = (io.aluOp === ALUOps.SUB) || 
+              (io.aluOp === ALUOps.SLT) || 
+              (io.aluOp === ALUOps.SLTU)
+  val operandB = Mux(isSub, ~io.b, io.b)
+  val sum = io.a + operandB + isSub.asUInt
 
-  io.out := 0.U
-  switch(io.aluOp) {
-    is(ALUOps.ADD)  { io.out := sum }
-    is(ALUOps.SUB)  { io.out := sum }
-    is(ALUOps.SLL)  { io.out := io.a << shamt }
-    is(ALUOps.SLT)  { io.out := Mux(io.a.asSInt < io.b.asSInt, 1.U, 0.U) }
-    is(ALUOps.SLTU) { io.out := Mux(io.a < io.b, 1.U, 0.U) }
-    is(ALUOps.XOR)  { io.out := io.a ^ io.b }
-    is(ALUOps.OR)   { io.out := io.a | io.b }
-    is(ALUOps.AND)  { io.out := io.a & io.b }
-    is(ALUOps.SRL)  { io.out := io.a >> shamt }
-    is(ALUOps.SRA)  { io.out := (io.a.asSInt >> shamt).asUInt }
+  io.result := MuxLookup(io.aluOp.asUInt, 0.U)(Seq(
+    ALUOps.ADD.asUInt  -> sum,
+    ALUOps.SUB.asUInt  -> sum,
+    ALUOps.SLL.asUInt  -> (io.a << shamt),
+    ALUOps.SLT.asUInt  -> Mux(io.a.asSInt < io.b.asSInt, 1.U, 0.U),
+    ALUOps.SLTU.asUInt -> Mux(io.a < io.b, 1.U, 0.U),
+    ALUOps.XOR.asUInt  -> (io.a ^ io.b),
+    ALUOps.SRL.asUInt  -> (io.a >> shamt),
+    ALUOps.SRA.asUInt  -> (io.a.asSInt >> shamt).asUInt,
+    ALUOps.OR.asUInt   -> (io.a | io.b),
+    ALUOps.AND.asUInt  -> (io.a & io.b)
+  ))
+
+  io.zero := (io.result === 0.U)
+}
+
+// ==========================================
+// 6. 分支判断单元
+// ==========================================
+class BranchUnit(implicit config: CPUConfig) extends Module {
+  val io = IO(new Bundle {
+    val funct3  = Input(UInt(3.W))
+    val aluZero = Input(Bool())
+    val aluOut  = Input(UInt(config.XLEN.W))
+    val taken   = Output(Bool())
+  })
+
+  io.taken := MuxLookup(io.funct3, false.B)(Seq(
+    "b000".U -> io.aluZero,
+    "b001".U -> !io.aluZero,
+    "b100".U -> (io.aluOut === 1.U),
+    "b101".U -> (io.aluOut === 0.U),
+    "b110".U -> (io.aluOut === 1.U),
+    "b111".U -> (io.aluOut === 0.U)
+  ))
+}
+
+// ==========================================
+// 7. 寄存器堆
+// ==========================================
+class RegisterFile(implicit config: CPUConfig) extends Module {
+  val io = IO(new Bundle {
+    val rs1Addr = Input(UInt(5.W))
+    val rs2Addr = Input(UInt(5.W))
+    val rdAddr  = Input(UInt(5.W))
+    val rdData  = Input(UInt(config.XLEN.W))
+    val rdWen   = Input(Bool())
+    val rs1Data = Output(UInt(config.XLEN.W))
+    val rs2Data = Output(UInt(config.XLEN.W))
+  })
+
+  val regs = RegInit(VecInit(Seq.fill(config.REG_NUM)(0.U(config.XLEN.W))))
+
+  io.rs1Data := Mux(io.rs1Addr === 0.U, 0.U, regs(io.rs1Addr))
+  io.rs2Data := Mux(io.rs2Addr === 0.U, 0.U, regs(io.rs2Addr))
+
+  when(io.rdWen && io.rdAddr =/= 0.U) {
+    regs(io.rdAddr) := io.rdData
   }
-  io.zf := (io.out === 0.U)
-  val signA = io.a(31); val signB = adderB(31); val signR = sum(31)
-  io.of := (io.aluOp === ALUOps.ADD || io.aluOp === ALUOps.SUB) && (signA === signB) && (signR =/= signA)
 }
 
 // ==========================================
-// 5. 寄存器堆
+// 8. 指令存储器
 // ==========================================
-class RegisterFile extends Module {
+class InstructionMemory(implicit config: CPUConfig) extends Module {
   val io = IO(new Bundle {
-    val rs1    = Input(UInt(5.W)); val rs2 = Input(UInt(5.W))
-    val waddr  = Input(UInt(5.W)); val wdata = Input(UInt(32.W))
-    val wen    = Input(Bool())
-    val rdata1 = Output(UInt(32.W)); val rdata2 = Output(UInt(32.W))
-  })
-  val regs = RegInit(VecInit(Seq.fill(32)(0.U(32.W))))
-  io.rdata1 := Mux(io.rs1 === 0.U, 0.U, regs(io.rs1))
-  io.rdata2 := Mux(io.rs2 === 0.U, 0.U, regs(io.rs2))
-  when(io.wen && io.waddr =/= 0.U) { regs(io.waddr) := io.wdata }
-}
-
-// ==========================================
-// 6. 异步指令存储器 (Instruction Memory)
-//    *** 关键修改：替换为实验六手册提供的机器码 ***
-// ==========================================
-class AsyncInstMem extends Module {
-  val io = IO(new Bundle {
-    val addr = Input(UInt(8.W))
-    val inst = Output(UInt(32.W))
+    val addr = Input(UInt(config.ADDR_WIDTH.W))
+    val inst = Output(UInt(config.XLEN.W))
   })
 
-  // 这里的指令序列来自实验手册 Source 910 和 Source 205
-  // 包含 beq, bne, jal, jalr 测试
-  val initProg = Seq(
-    "h00500113".U, // 00: addi x2, x0, 5
-    "h00500193".U, // 04: addi x3, x0, 5 (手册中注释写x3=6, 但机器码00500193确实是addi x3,x0,5。若x3=5则beq成立)
-    "h00310663".U, // 08: beq x2, x3, +12 (跳转到 beq_pass)
-    "h00f00513".U, // 0C: addi x10, x0, 15 (Fail标记)
-    "h0080006f".U, // 10: j beq_end
-    "h00100513".U, // 14: beq_pass: addi x10, x0, 1 (Success标记)
-    "h00500113".U, // 18: beq_end: addi x2, x0, 5
-    "h00600193".U, // 1C: addi x3, x0, 6
-    "h00311663".U, // 20: bne x2, x3, +12 (跳转到 bne_pass)
-    "h00f00593".U, // 24: addi x11, x0, 15 (Fail标记)
-    "h0080006f".U, // 28: j bne_end
-    "h00100593".U, // 2C: bne_pass: addi x11, x0, 1 (Success标记)
-    "h00c000ef".U, // 30: bne_end: jal x1, func
-    "h00100693".U, // 34: addi x13, x0, 1 (返回后执行)
-    "h00c0006f".U, // 38: j end
-    "h00100613".U, // 3C: func: addi x12, x0, 1
-    "h00008067".U, // 40: jalr x0, 0(x1) (返回)
-    "h0000006f".U  // 44: end: j end (死循环)
-  ) ++ Seq.fill(240)("h00000013".U) // 填充 NOP
+  val program = Seq(
+    "h00500113".U,  // 0x00: addi x2, x0, 5
+    "h00500193".U,  // 0x04: addi x3, x0, 5
+    "h00310663".U,  // 0x08: beq x2, x3, 12
+    "h00f00513".U,  // 0x0C: addi x10, x0, 15
+    "h0080006f".U,  // 0x10: jal x0, 8
+    "h00100513".U,  // 0x14: addi x10, x0, 1
+    "h00500113".U,  // 0x18: addi x2, x0, 5
+    "h00600193".U,  // 0x1C: addi x3, x0, 6
+    "h00311663".U,  // 0x20: bne x2, x3, 12
+    "h00f00593".U,  // 0x24: addi x11, x0, 15
+    "h0080006f".U,  // 0x28: jal x0, 8
+    "h00100593".U,  // 0x2C: addi x11, x0, 1
+    "h00c000ef".U,  // 0x30: jal x1, 12
+    "h00100693".U,  // 0x34: addi x13, x0, 1
+    "h00c0006f".U,  // 0x38: jal x0, 12
+    "h00100613".U,  // 0x3C: addi x12, x0, 1
+    "h00008067".U,  // 0x40: jalr x0, 0(x1)
+    "h0000006f".U   // 0x44: jal x0, 0
+  )
 
-  val mem = VecInit(initProg)
-  io.inst := mem(io.addr)
+  val mem = RegInit(VecInit(program ++ Seq.fill(config.IMEM_SIZE - program.length)("h00000013".U)))
+  
+  val wordAddr = io.addr(31, 2)
+  io.inst := mem(wordAddr)
 }
 
 // ==========================================
-// 7. 异步数据存储器 (Data Memory)
+// 9. 数据存储器
 // ==========================================
-class AsyncDataMem extends Module {
+class DataMemory(implicit config: CPUConfig) extends Module {
   val io = IO(new Bundle {
-    val addr  = Input(UInt(32.W)); val wdata = Input(UInt(32.W))
+    val addr  = Input(UInt(config.ADDR_WIDTH.W))
+    val wdata = Input(UInt(config.XLEN.W))
     val wen   = Input(Bool())
-    val rdata = Output(UInt(32.W))
+    val rdata = Output(UInt(config.XLEN.W))
   })
-  val mem = RegInit(VecInit(Seq.fill(128)(0.U(32.W))))
-  val wordAddr = io.addr(8, 2)
+
+  val mem = RegInit(VecInit(Seq.fill(config.DMEM_SIZE)(0.U(config.XLEN.W))))
+  
+  val wordAddr = io.addr(31, 2)
+  
   io.rdata := mem(wordAddr)
-  when(io.wen) { mem(wordAddr) := io.wdata }
+  
+  when(io.wen) {
+    mem(wordAddr) := io.wdata
+  }
 }
 
 // ==========================================
-// 8. 单周期 CPU 顶层
+// 10. 数据通路 (Datapath)
 // ==========================================
-class SingleCycleCPU extends Module {
+class Datapath(implicit config: CPUConfig) extends Module {
   val io = IO(new Bundle {
-    val zf = Output(Bool()); val of = Output(Bool())
-    val aluResult = Output(UInt(32.W)); val currentInst = Output(UInt(32.W))
-    val currentPC = Output(UInt(32.W)); val isSignedOp = Output(Bool())
-    val dmemWen = Output(Bool()); val dmemAddr = Output(UInt(32.W))
-    val dmemWData = Output(UInt(32.W)); val dmemRData = Output(UInt(32.W))
+    val imemInst = Input(UInt(config.XLEN.W))
+    val dmemData = Input(UInt(config.XLEN.W))
+    val ctrl     = Input(new ControlSignals)
+    
+    val pc       = Output(UInt(config.ADDR_WIDTH.W))
+    val aluOut   = Output(UInt(config.XLEN.W))
+    val memWData = Output(UInt(config.XLEN.W))
   })
 
-  val pcReg = RegInit(0.U(32.W))
-  val control = Module(new ControlUnit)
+  // ========== 模块实例化 ==========
   val regFile = Module(new RegisterFile)
   val immGen  = Module(new ImmGen)
   val alu     = Module(new ALU)
-  val imem    = Module(new AsyncInstMem)
-  val dmem    = Module(new AsyncDataMem)
+  val branch  = Module(new BranchUnit)
 
-  // 取指
-  io.currentPC := pcReg
-  imem.io.addr := pcReg(9, 2)
-  val inst = imem.io.inst
-  io.currentInst := inst
+  // ========== PC 寄存器 ==========
+  val pcReg = RegInit(config.PC_START.U(config.ADDR_WIDTH.W))
+  io.pc := pcReg
 
-  // 连接部件
-  control.io.opcode := inst(6, 0); control.io.funct3 := inst(14, 12); control.io.funct7 := inst(31, 25)
+  // ========== 取指 ==========
+  val inst = io.imemInst
+
+  // ========== 译码 ==========
   immGen.io.inst := inst
-  regFile.io.rs1 := inst(19, 15); regFile.io.rs2 := inst(24, 20)
-  regFile.io.waddr := inst(11, 7); regFile.io.wen := control.io.regWen
+  
+  regFile.io.rs1Addr := inst(19, 15)
+  regFile.io.rs2Addr := inst(24, 20)
+  regFile.io.rdAddr  := inst(11, 7)
+  regFile.io.rdWen   := io.ctrl.regWen
 
-  // ALU 输入选择
-  val src1 = MuxLookup(control.io.src1Sel, 0.U)(Seq(0.U -> regFile.io.rdata1, 1.U -> pcReg, 2.U -> 0.U))
-  val src2 = Mux(control.io.src2Sel === 1.U, immGen.io.out, regFile.io.rdata2)
-  alu.io.a := src1; alu.io.b := src2; alu.io.aluOp := control.io.aluOp
+  // ========== 执行 ==========
+  val aluSrc1 = MuxLookup(io.ctrl.aluSrc1, regFile.io.rs1Data)(Seq(
+    0.U -> regFile.io.rs1Data,
+    1.U -> pcReg,
+    2.U -> 0.U
+  ))
 
-  // 访存
-  dmem.io.addr := alu.io.out; dmem.io.wdata := regFile.io.rdata2; dmem.io.wen := control.io.memWen
+  val aluSrc2 = Mux(io.ctrl.aluSrc2, immGen.io.imm, regFile.io.rs2Data)
 
-  // 写回寄存器堆: 增加 isLink 判断，若为 JAL/JALR 则写回 PC+4 [cite: 728, 835]
+  alu.io.a     := aluSrc1
+  alu.io.b     := aluSrc2
+  alu.io.aluOp := io.ctrl.aluOp
+
+  io.aluOut   := alu.io.result
+  io.memWData := regFile.io.rs2Data
+
+  // ========== 分支判断 ==========
+  branch.io.funct3  := inst(14, 12)
+  branch.io.aluZero := alu.io.zero
+  branch.io.aluOut  := alu.io.result
+
+  // ========== 写回 ==========
   val pcPlus4 = pcReg + 4.U
-  val wbData = Mux(control.io.isLink, pcPlus4, Mux(control.io.wbSel === 1.U, dmem.io.rdata, alu.io.out))
-  regFile.io.wdata := wbData
-
-  // ---------------------------------------------
-  // PC 更新逻辑 (Experiment 6 核心)
-  // ---------------------------------------------
   
-  // 1. 计算跳转目标地址
-  // JAL 和 Branch 的目标是 PC + Imm [cite: 721]
-  val branchTarget = (pcReg.asSInt + immGen.io.out.asSInt).asUInt
+  val wbData = MuxLookup(io.ctrl.wbSrc, alu.io.result)(Seq(
+    0.U -> alu.io.result,
+    1.U -> io.dmemData,
+    2.U -> pcPlus4
+  ))
   
-  // JALR 的目标是 (RS1 + Imm) & ~1 [cite: 721]
-  // ControlUnit 中 JALR 会让 ALU 计算 RS1 + Imm，所以直接取 alu.io.out 并清零最低位
-  val jalrTarget = alu.io.out & "hfffffffe".U
+  regFile.io.rdData := wbData
 
-  // 2. 判断是否满足跳转条件 (Taken)
-  // beq: ZF=1 跳转; bne: ZF=0 跳转 
-  val isTaken = control.io.isBranch && Mux(control.io.isBeq, alu.io.zf, !alu.io.zf)
+  // ========== PC 更新 ==========
+  val branchTarget = (pcReg.asSInt + immGen.io.imm.asSInt).asUInt
+  val jalrTarget   = alu.io.result & "hfffffffe".U
 
-  // 3. 多路选择生成 Next PC
-  // 优先级: JALR > (JAL | BranchTaken) > PC+4
-  val nextPC = Mux(control.io.isJalr,
-    jalrTarget,
-    Mux(control.io.isJal || isTaken, branchTarget, pcPlus4)
-  )
+  val nextPC = MuxLookup(io.ctrl.pcSrc, pcPlus4)(Seq(
+    0.U -> pcPlus4,
+    1.U -> Mux(branch.io.taken, branchTarget, pcPlus4),
+    2.U -> branchTarget,
+    3.U -> jalrTarget
+  ))
 
   pcReg := nextPC
-
-  // 调试信号输出
-  io.aluResult := alu.io.out; io.zf := alu.io.zf; io.of := alu.io.of; io.isSignedOp := control.io.isSigned
-  io.dmemWen := control.io.memWen; io.dmemAddr := alu.io.out; io.dmemWData := regFile.io.rdata2; io.dmemRData := dmem.io.rdata
 }
 
-// 生成 Verilog
+// ==========================================
+// 11. 单周期 CPU 顶层
+// ==========================================
+class SingleCycleCPU(implicit config: CPUConfig) extends Module {
+  val io = IO(new Bundle {
+    val debug = new Bundle {
+      val pc       = Output(UInt(config.ADDR_WIDTH.W))
+      val inst     = Output(UInt(config.XLEN.W))
+      val aluOut   = Output(UInt(config.XLEN.W))
+      val memAddr  = Output(UInt(config.ADDR_WIDTH.W))
+      val memWData = Output(UInt(config.XLEN.W))
+      val memRData = Output(UInt(config.XLEN.W))
+      val memWen   = Output(Bool())
+    }
+  })
+
+  val control  = Module(new ControlUnit)
+  val datapath = Module(new Datapath)
+  val imem     = Module(new InstructionMemory)
+  val dmem     = Module(new DataMemory)
+
+  // ========== 取指 ==========
+  imem.io.addr := datapath.io.pc
+  val inst = imem.io.inst
+
+  // ========== 控制器 ==========
+  control.io.opcode := inst(6, 0)
+  control.io.funct3 := inst(14, 12)
+  control.io.funct7 := inst(31, 25)
+
+  // ========== 数据通路 ==========
+  datapath.io.imemInst := inst
+  datapath.io.ctrl     := control.io.ctrl
+  datapath.io.dmemData := dmem.io.rdata
+
+  // ========== 数据存储器 ==========
+  dmem.io.addr  := datapath.io.aluOut
+  dmem.io.wdata := datapath.io.memWData
+  dmem.io.wen   := control.io.ctrl.memWen
+
+  // ========== 调试输出 ==========
+  io.debug.pc       := datapath.io.pc
+  io.debug.inst     := inst
+  io.debug.aluOut   := datapath.io.aluOut
+  io.debug.memAddr  := datapath.io.aluOut
+  io.debug.memWData := datapath.io.memWData
+  io.debug.memRData := dmem.io.rdata
+  io.debug.memWen   := control.io.ctrl.memWen
+}
+
+// ==========================================
+// 12. 顶层生成
+// ==========================================
 object CPUGen extends App {
+  implicit val config = new CPUConfig
+  
   emitVerilog(new SingleCycleCPU, Array("--target-dir", "generated"))
 }
